@@ -1,15 +1,15 @@
 ################################################################################
-# varp_levels_forecast.R
-# ---------------------------------------------------------------------------
-# Fits a VAR(p) to the "Canada" dataset (differenced data), using:
-#   1) Ridge
-#   2) Nonparametric Shrinkage
-#   3) Normal prior via Stan
-#   4) Lasso prior via Stan
-#   5) Horseshoe prior via Stan
-# Produces 1-step-ahead forecasts on the differenced scale,
-# inverts them to the original (levels) scale, and evaluates both RMSE and MAPE.
-# Also plots forecast vs. actual for the final test portion.
+# compare_VARp_methods_1step_rolling.R
+# ------------------------------------------------------------------------------
+# Illustrates how to fit a VAR(p) to differenced "Canada" data, using:
+#   1) Ridge (frequentist)
+#   2) Nonparametric Shrinkage (frequentist)
+#   3) Normal prior (Bayesian) via Stan
+#   4) Lasso prior (Bayesian) via Stan
+#   5) Horseshoe prior (Bayesian) via Stan
+#
+# Then we do rolling 1-step-ahead forecasts on the *levels*, updating the
+# "actual" differences after each step (same approach as your "script two").
 ################################################################################
 
 # -------------------------
@@ -21,170 +21,167 @@ library(glmnet)
 library(rstan)
 library(tidyverse)
 
-# For faster Stan compilation (optional)
+# Speed up Stan (optional)
 options(mc.cores = parallel::detectCores())
 rstan_options(auto_write = TRUE)
 
 # -------------------------
-# 2) Load and prepare data
+# 2) Load and difference the data
 # -------------------------
 data("Canada")
-# We'll use the first 4 columns (e, prod, rw, U):
-Y_levels <- as.matrix(Canada[, 1:4])  # the original "levels" data
-colnames(Y_levels) <- c("e", "prod", "rw", "U")
+Y_levels <- as.matrix(Canada[, 1:4])  # columns: e, prod, rw, U
+colnames(Y_levels) <- c("e","prod","rw","U")
 
-# Create differenced data for fitting:
+# We'll difference once (like script two).
 Y_diff <- diff(Y_levels)
 
-# We'll set up a holdout of the last 4 "differences" for testing
-# i.e. fit on first (Tfull_diff - 4) differences, then test on final 4 differences
-Tfull_levels <- nrow(Y_levels)
-Tfull_diff   <- nrow(Y_diff)
+# Dimensions
+Tfull_levels <- nrow(Y_levels)  # number of time points in levels
+Tfull_diff   <- nrow(Y_diff)    # number of time points in differences
+d <- ncol(Y_diff)               # dimension (4 for e, prod, rw, U)
 
-p <- 6  # number of lags
-Ttrain_diff <- Tfull_diff - 4
-Ytrain_diff <- Y_diff[1:Ttrain_diff, , drop = FALSE]
-Ytest_diff  <- Y_diff[(Ttrain_diff + 1):Tfull_diff, , drop = FALSE]
+# We'll hold out the last few rows for testing. For illustration, say last 4 diffs:
+Ttest_diff <- 4
+Ttrain_diff <- Tfull_diff - Ttest_diff
+Ytrain_diff <- Y_diff[1:Ttrain_diff, , drop=FALSE]
+Ytest_diff  <- Y_diff[(Ttrain_diff+1):Tfull_diff, , drop=FALSE]
 
-# For evaluation on the *levels* scale:
-# If Y_diff[i, ] = Y_levels[i+1, ] - Y_levels[i, ], then
-# Ytest_diff[k, ] corresponds to the difference between
-#   Y_levels[Ttrain_diff + k + 1, ] and Y_levels[Ttrain_diff + k, ].
-# We'll keep the relevant portion of the levels data for final evaluation:
-Ytrain_levels <- Y_levels[1:(Ttrain_diff + 1), , drop = FALSE]
-Ytest_levels  <- Y_levels[(Ttrain_diff + 1):Tfull_levels, , drop = FALSE]
+# The corresponding levels we have:
+#  - The "training levels" end exactly one row after Ytrain_diff
+#  - The "test levels" start there
+Ytrain_levels <- Y_levels[1:(Ttrain_diff + 1), , drop=FALSE]
+Ytest_levels  <- Y_levels[(Ttrain_diff + 1):Tfull_levels, , drop=FALSE]
 
-cat("Number of rows in Ytest_levels =", nrow(Ytest_levels),
-    "(should be 5 if we have 4 test differences)\n")
+cat("Train diffs has", nrow(Ytrain_diff), "rows.\n")
+cat("Test diffs has ", nrow(Ytest_diff), "rows.\n")
+cat("Train levels has", nrow(Ytrain_levels), "rows.\n")
+cat("Test levels has ", nrow(Ytest_levels), "rows.\n")
+
+# The actual test portion on the *levels* side is 1-step-ahead forecasts for the
+# final 4 time points, so Ytest_levels is (4+1)=5 rows in that scenario.
+# The first row of Ytest_levels is effectively "initialization" for the test set,
+# and the last 4 rows are the actual times we will forecast.
 
 # -------------------------
-# 3) Helper functions
+# 3) Build design matrix for Ytrain_diff
+#    (like your original 'make_VAR_design_p' function)
 # -------------------------
-
-# (a) Build design matrix for a VAR(p) on *differenced* data
 make_VAR_design_p <- function(Y, p) {
-  # Y: T x d (already differenced)
+  # Y: T x d matrix (already differenced)
   # p: number of lags
-  # returns:
-  #   X: (T - p) x (d*p)
+  # Returns:
+  #   X: (T - p) x (d * p)
   #   Y_out: (T - p) x d
   T <- nrow(Y)
   d <- ncol(Y)
+  if(T - p <= 0) return(list(X=NULL, Y=NULL))
 
-  X <- matrix(NA_real_, nrow = T - p, ncol = d * p)
-  Y_out <- Y[(p + 1):T, , drop = FALSE]
-  for (t in (p + 1):T) {
+  X <- matrix(NA_real_, nrow=T-p, ncol=d*p)
+  Y_out <- Y[(p+1):T, , drop=FALSE]
+
+  for(t in (p+1):T) {
     row_idx <- t - p
+    # gather y_{t-1}, ..., y_{t-p} (each is dimension d) into one row
     lags <- c()
-    for (lag_i in 1:p) {
+    for(lag_i in 1:p) {
       lags <- c(lags, Y[t - lag_i, ])
     }
     X[row_idx, ] <- lags
   }
-  list(X = X, Y = Y_out)
+  list(X=X, Y=Y_out)
 }
 
-# (b) Compute accuracy metrics (RMSE and MAPE)
-#    actual, predicted: T x d matrices
-get_accuracy_metrics <- function(actual, predicted) {
-  # actual, predicted: same dimensions
-  # We'll average across *all time points and variables* for a single metric:
-  #   RMSE = sqrt( mean( (actual - predicted)^2 ) )
-  #   MAPE = 100 * mean( abs( (actual - predicted) / actual ) )
-  # The latter ignores cases where 'actual' is zero or very close to zero.
-
-  # Vectorize over all elements:
-  diff_vals  <- as.numeric(actual - predicted)
-  actual_vals <- as.numeric(actual)
-
-  rmse <- sqrt(mean(diff_vals^2))
-
-  # For MAPE, filter out where actual=0 or near zero if needed
-  nonzero_idx <- which(abs(actual_vals) > 1e-8)
-  mape <- NA_real_
-  if (length(nonzero_idx) > 0) {
-    mape <- 100 * mean(abs(diff_vals[nonzero_idx] / actual_vals[nonzero_idx]))
-  }
-
-  return(list(RMSE = rmse, MAPE = mape))
-}
-
-# (c) Forecast function for differenced data -> returns predictions on *levels*
-forecast_VARp_on_levels <- function(B, Ytrain_diff, Ytrain_levels, Ytest_diff, p) {
-  # B: (d x d*p) fitted on differenced data
-  # Ytrain_diff: (Ttrain_diff x d)
-  # Ytrain_levels: (Ttrain_diff+1 x d) => original levels up to same time
-  # Ytest_diff: (Ttest_diff x d)
-  # p: integer
+# -------------------------
+# 4) Rolling 1-step-ahead forecast function on the *levels*
+# -------------------------
+one_step_ahead_forecast <- function(B, Ytrain_diff, Ytrain_levels, Ytest_levels, p) {
   #
-  # Returns a (Ttest_diff x d) matrix of predicted *levels*.
-
+  # B: (d x (d*p)) coefficient matrix from the differenced VAR(p) model
+  # Ytrain_diff: training diffs (Ttrain_diff x d)
+  # Ytrain_levels: training levels (Ttrain_diff+1 x d)
+  # Ytest_levels: test levels (4+1 x d) if 4 test diffs
+  # p: integer lag
+  #
+  # Returns a (Ttest x d) matrix of predicted *levels*, where Ttest = nrow(Ytest_levels)-1.
+  # The logic is exactly as in "script two":
+  #   - Keep track of the last p actual differences in a buffer
+  #   - Start from the last training level as "current_level"
+  #   - For each step i=1..Ttest:
+  #       (i)   Build 1 x (d*p) from the p most recent actual differences
+  #       (ii)  Predict the *difference*
+  #       (iii) Forecasted level = current_level + predicted_diff
+  #       (iv)  Then update "current_level" to the *actual* next level from Ytest_levels
+  #             so that subsequent steps use the actual difference
+  #
   d <- ncol(Ytrain_diff)
-  Ttest_diff <- nrow(Ytest_diff)
-  Y_for_forecast_diff <- rbind(tail(Ytrain_diff, p), Ytest_diff)
+  Ttest <- nrow(Ytest_levels) - 1  # if you have 4 test diffs => 5 test level rows => Ttest=4
+  preds <- matrix(NA_real_, nrow=Ttest, ncol=d)
+  colnames(preds) <- colnames(Ytrain_levels)
 
-  # Prepare storage for predictions on the levels scale
-  preds_levels <- matrix(NA_real_, nrow = Ttest_diff, ncol = d)
+  # The last p diffs from training
+  diff_history <- tail(Ytrain_diff, p)  # shape p x d
+  # The current "actual" level is last row of the training set
+  current_level <- tail(Ytrain_levels, 1)  # shape 1 x d
 
-  # Start from the last known "actual" level in training:
-  current_level <- tail(Ytrain_levels, 1)  # 1 x d
+  for(i in seq_len(Ttest)) {
+    # (i) Build the 1 x (d*p) lag vector from diff_history, with the most recent diff first
+    #     i.e. diff_history[p, ] is most recent
+    lag_vec <- as.vector(t(diff_history[p:1, , drop=FALSE]))  # flatten row by row
+    lag_vec <- matrix(lag_vec, nrow=1) # shape: 1 x (d*p)
 
-  # 1-step prediction in differenced space
-  predict_VARp_diff <- function(B, y_lags) {
-    # B: d x (d*p)
-    # y_lags: 1 x (d*p)
-    return(y_lags %*% t(B))  # => 1 x d
-  }
+    # (ii) Predict the next difference
+    pred_diff <- lag_vec %*% t(B)   # shape 1 x d
 
-  # Rolling forecast in differenced domain, revert to levels:
-  for (i in seq_len(Ttest_diff)) {
-    row_idx <- p + i - 1
-    lags <- c()
-    for (lag_j in 0:(p - 1)) {
-      lags <- c(lags, Y_for_forecast_diff[row_idx - lag_j, ])
+    # (iii) Forecast level = current_level + predicted diff
+    pred_level <- current_level + pred_diff
+    preds[i, ] <- pred_level
+
+    # (iv) Update to the *actual* next level from Ytest_levels
+    #      So that the next step uses the real new difference
+    actual_next_level <- Ytest_levels[i+1, , drop=FALSE]
+    new_diff <- actual_next_level - current_level
+
+    # Shift the diff_history up by 1, then add the new_diff
+    if(p>1) {
+      diff_history <- rbind(diff_history[-1, , drop=FALSE], new_diff)
+    } else {
+      diff_history <- new_diff
     }
-    lags <- matrix(lags, nrow = 1)
-
-    # 1) Forecast difference
-    pred_diff <- predict_VARp_diff(B, lags)  # 1 x d
-
-    # 2) Convert to levels
-    pred_level <- current_level + pred_diff  # 1 x d
-
-    preds_levels[i, ] <- pred_level
-    # 3) Update
-    current_level <- pred_level
+    current_level <- actual_next_level
   }
-  return(preds_levels)
+  preds
 }
 
+# (Optional) RMSE / MAPE helpers
+rmse <- function(actual, predicted) {
+  sqrt(mean((actual - predicted)^2, na.rm=TRUE))
+}
+mape <- function(actual, predicted, eps=1e-8) {
+  # skip near-zero actual
+  idx <- abs(actual) > eps
+  if(!any(idx)) return(NA_real_)
+  100 * mean(abs((actual[idx] - predicted[idx]) / actual[idx]))
+}
+
+
 # -------------------------
-# 4) Prepare training design for differenced model-fitting
+# 5) Choose a lag order p
 # -------------------------
+p <- 10
+
+# Make design matrix from Ytrain_diff
 train_data <- make_VAR_design_p(Ytrain_diff, p)
-X_train <- train_data$X   # (Ttrain_diff - p) x (d*p)
-Y_train <- train_data$Y   # (Ttrain_diff - p) x d
-d <- ncol(Y_train)
-cat("Shape of X_train =", dim(X_train), ", Y_train =", dim(Y_train), "\n")
+X_train <- train_data$X  # shape: (Ttrain_diff - p) x (d*p)
+Y_train <- train_data$Y  # shape: (Ttrain_diff - p) x d
 
-# We'll also define the test set size:
-Ttest_diff <- nrow(Ytest_diff)
-
-# The actual test *levels* we compare against are:
-#   Ytest_levels[2:(Ttest_diff + 1), ]
-# because the first row in Ytest_levels is effectively
-# the "initial condition" for the test segment.
-
-actual_test_levels <- Ytest_levels[2:(Ttest_diff + 1), , drop = FALSE]
+cat("X_train shape:", dim(X_train), "\n")
+cat("Y_train shape:", dim(Y_train), "\n")
 
 # -------------------------
-# 5) Fit Models
+# 6) Fit each method
 # -------------------------
-
-#####################
-# (a) Ridge (glmnet)
-#####################
-lambda_ridge <- 0.1  # example fixed lambda
+## (a) Ridge (frequentist)
+lambda_ridge <- 0.1
 ridge_fit <- glmnet(
   x = X_train,
   y = Y_train,
@@ -193,76 +190,67 @@ ridge_fit <- glmnet(
   lambda = lambda_ridge,
   intercept = FALSE
 )
-coef_ridge <- coef(ridge_fit, s = lambda_ridge)
-Bhat_ridge <- matrix(NA, nrow = d, ncol = d*p)
-for (j in seq_len(d)) {
+
+# Extract coefs => (d x d*p)
+coef_ridge <- coef(ridge_fit, s=lambda_ridge)
+Bhat_ridge <- matrix(NA, nrow=d, ncol=d*p)
+for (j in 1:d) {
   Bhat_ridge[j, ] <- as.numeric(coef_ridge[[j]])[2:(d*p + 1)]
 }
 
-############################
-# (b) Nonparametric Shrinkage
-############################
+## (b) Nonparametric Shrinkage (frequentist)
 fit_ns <- VARshrink(
-  y    = Y_train,    # differenced
+  y    = Ytrain_diff,
   p    = p,
-  type = "none",     # no intercept
-  method = "ns"
+  type = "none",  # no intercept in the differences
+  method="ns"
 )
-varlist <- fit_ns$varresult  # list of length d
-Bhat_ns <- matrix(NA, nrow = d, ncol = d*p)
-for (j in seq_len(d)) {
-  Bhat_ns[j, ] <- varlist[[j]]$coefficients
+Bhat_ns <- matrix(NA, nrow=d, ncol=d*p)
+for (j in 1:d) {
+  Bhat_ns[j, ] <- fit_ns$varresult[[j]]$coefficients
 }
 
-################################
-# (c) Bayesian Normal prior (Stan)
-################################
+## (c) Normal prior (Stan)
 stan_data_normal <- list(
-  T = nrow(X_train),
-  d = d,
-  p = p,
-  X = X_train,
-  Y = Y_train,
+  T           = nrow(X_train),  # number of training rows for X
+  d           = d,
+  p           = p,
+  X           = X_train,
+  Y           = Y_train,
   prior_scale = 1.0
 )
 fit_normal <- stan(
-  file = "stan/var_normal.stan",  # must exist locally
-  data = stan_data_normal,
-  iter = 2000,
+  file   = "helicon/stan/var_normal.stan",
+  data   = stan_data_normal,
+  iter   = 2000,
   warmup = 500,
-  chains = 2,   # reduce if you want faster
-  seed = 123,
-  control = list(adapt_delta = 0.9, max_treedepth = 12)
+  chains = 2,
+  seed   = 123
 )
-post_normal <- rstan::extract(fit_normal, pars = "B")
-Bhat_normal <- apply(post_normal$B, c(2,3), mean)  # => d x (d*p)
+post_normal <- rstan::extract(fit_normal, "B")  # shape: draws x d x (d*p)
+Bhat_normal <- apply(post_normal$B, c(2,3), mean)
 
-############################
-# (d) Bayesian Lasso prior (Stan)
-############################
+## (d) Lasso prior (Stan)
 stan_data_lasso <- list(
-  T = nrow(X_train),
-  d = d,
-  p = p,
-  X = X_train,
-  Y = Y_train,
+  T      = nrow(X_train),
+  d      = d,
+  p      = p,
+  X      = X_train,
+  Y      = Y_train,
   lambda = 1.0
 )
 fit_lasso <- stan(
-  file = "stan/var_lasso.stan",  # must exist locally
-  data = stan_data_lasso,
-  iter = 2000,
+  file   = "helicon/stan/var_lasso.stan",
+  data   = stan_data_lasso,
+  iter   = 2000,
   warmup = 500,
   chains = 2,
-  seed = 123,
-  control = list(adapt_delta = 0.9, max_treedepth = 12)
+  seed   = 123
 )
-post_lasso <- rstan::extract(fit_lasso, pars = "B")
+post_lasso <- rstan::extract(fit_lasso, "B")
 Bhat_lasso <- apply(post_lasso$B, c(2,3), mean)
 
-############################
-# (e) Bayesian Horseshoe prior (Stan)
-############################
+## (e) Horseshoe prior (Stan)
 stan_data_hs <- list(
   T = nrow(X_train),
   d = d,
@@ -271,144 +259,221 @@ stan_data_hs <- list(
   Y = Y_train
 )
 fit_hs <- stan(
-  file = "stan/var_horseshoe.stan",  # must exist locally
-  data = stan_data_hs,
-  iter = 2000,
+  file   = "helicon/stan/var_horseshoe.stan",
+  data   = stan_data_hs,
+  iter   = 2000,
   warmup = 500,
   chains = 2,
-  seed = 123,
-  control = list(adapt_delta = 0.9, max_treedepth = 12)
+  seed   = 123
 )
-post_hs <- rstan::extract(fit_hs, pars = "B")
+post_hs <- rstan::extract(fit_hs, "B")
 Bhat_hs <- apply(post_hs$B, c(2,3), mean)
 
 # -------------------------
-# 6) Evaluate forecasts on the original (levels) scale
+# 7) Produce rolling 1-step-ahead forecasts on levels
 # -------------------------
-# We'll create a named list of all Bhat matrices, then iterate:
-method_list <- list(
-  Ridge           = Bhat_ridge,
-  NonparamShrink  = Bhat_ns,
-  Normal          = Bhat_normal,
-  Lasso           = Bhat_lasso,
-  Horseshoe       = Bhat_hs
+pred_ridge <- one_step_ahead_forecast(Bhat_ridge, Ytrain_diff, Ytrain_levels, Ytest_levels, p)
+pred_ns    <- one_step_ahead_forecast(Bhat_ns,    Ytrain_diff, Ytrain_levels, Ytest_levels, p)
+pred_norm  <- one_step_ahead_forecast(Bhat_normal,Ytrain_diff, Ytrain_levels, Ytest_levels, p)
+pred_lasso <- one_step_ahead_forecast(Bhat_lasso, Ytrain_diff, Ytrain_levels, Ytest_levels, p)
+pred_hs    <- one_step_ahead_forecast(Bhat_hs,    Ytrain_diff, Ytrain_levels, Ytest_levels, p)
+
+# The "actual" test-level rows that match these 1-step forecasts
+# If Ytest_levels has 5 rows, the first row is used for initialization,
+# so the final 4 rows are the actual next-step levels:
+actual_test <- Ytest_levels[2:nrow(Ytest_levels), , drop=FALSE]  # shape (4 x d)
+colnames(actual_test) <- colnames(Y_levels)
+
+# -------------------------
+# 8) Compute RMSE / MAPE
+# -------------------------
+methods <- c("Ridge","NS","Normal","Lasso","Horseshoe")
+pred_list <- list(pred_ridge, pred_ns, pred_norm, pred_lasso, pred_hs)
+
+rmse_vals <- sapply(pred_list, function(P) rmse(actual_test, P))
+mape_vals <- sapply(pred_list, function(P) mape(actual_test, P))
+
+results_df <- data.frame(
+  Method = methods,
+  RMSE   = rmse_vals,
+  MAPE   = mape_vals
 )
+results_df
 
-results_list <- list()  # to store metrics, predictions, etc.
-
-for (m in names(method_list)) {
-  Bmat <- method_list[[m]]
-  # 1) Get predictions on levels
-  preds_levels <- forecast_VARp_on_levels(Bmat, Ytrain_diff, Ytrain_levels, Ytest_diff, p)
-  # 2) Compute metrics
-  metrics <- get_accuracy_metrics(actual_test_levels, preds_levels)
-  # 3) Store
-  results_list[[m]] <- list(
-    preds_levels = preds_levels,
-    RMSE         = metrics$RMSE,
-    MAPE         = metrics$MAPE
+# Optionally, per-variable errors:
+per_var <- lapply(pred_list, function(P) {
+  data.frame(
+    var=colnames(P),
+    RMSE=sapply(seq_len(d), function(j) rmse(actual_test[,j], P[,j])),
+    MAPE=sapply(seq_len(d), function(j) mape(actual_test[,j], P[,j]))
   )
-}
+})
+names(per_var) <- methods
 
-# Convert results to a tibble
-final_results <- tibble(
-  Method = names(results_list),
-  RMSE_onLevels = sapply(results_list, function(x) x$RMSE),
-  MAPE_onLevels = sapply(results_list, function(x) x$MAPE)
-)
-
-cat("\nFinal Accuracy Results on the Original (Levels) Scale:\n")
-print(final_results)
+# Example: Show per-variable error for Horseshoe
+per_var$Horseshoe
 
 # -------------------------
-# 7) Plot forecast vs. actual for the test set
+# 9) Done!
 # -------------------------
-# We want a long data frame: columns = (Time, Method, Value, Variable, Type)
-# where Type is "Actual" or "Forecast", etc.
+cat("\nRolling 1-step-ahead forecast comparison:\n")
+print(results_df)
 
-# The test set has Ttest_diff rows of predictions, but Ttest_diff+1 actual rows,
-# so we compare row i of predictions to row i+1 of Ytest_levels.
-# We'll define a small time index for the test portion: 1..Ttest_diff
-test_time <- seq_len(Ttest_diff)
-actual_df <- data.frame(
-  Time     = test_time,
-  Variable = rep(colnames(Y_levels), each = Ttest_diff),
-  Value    = as.vector(actual_test_levels),
-  Method   = "Actual"
+
+
+
+
+
+
+
+
+
+# -- Step A: Build data frames of predicted and actual values in "long" format
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# 1) Actuals
+df_actual <- data.frame(
+  HoldoutIndex = 1:nrow(actual_test),  # 1..4
+  e    = actual_test[, "e"],
+  prod = actual_test[, "prod"],
+  rw   = actual_test[, "rw"],
+  U    = actual_test[, "U"]
+)
+df_actual_long <- df_actual %>%
+  pivot_longer(cols = -HoldoutIndex, names_to = "variable", values_to = "Value") %>%
+  mutate(Method = "Actual")
+
+# 2) Horseshoe
+df_hs <- data.frame(
+  HoldoutIndex = 1:nrow(pred_hs),
+  e    = pred_hs[, "e"],
+  prod = pred_hs[, "prod"],
+  rw   = pred_hs[, "rw"],
+  U    = pred_hs[, "U"]
+)
+df_hs_long <- df_hs %>%
+  pivot_longer(cols = -HoldoutIndex, names_to = "variable", values_to = "Value") %>%
+  mutate(Method = "Horseshoe")
+
+# 3) Lasso
+df_lasso <- data.frame(
+  HoldoutIndex = 1:nrow(pred_lasso),
+  e    = pred_lasso[, "e"],
+  prod = pred_lasso[, "prod"],
+  rw   = pred_lasso[, "rw"],
+  U    = pred_lasso[, "U"]
+)
+df_lasso_long <- df_lasso %>%
+  pivot_longer(cols = -HoldoutIndex, names_to = "variable", values_to = "Value") %>%
+  mutate(Method = "Lasso")
+
+# 4) NonparamShrink
+df_ns <- data.frame(
+  HoldoutIndex = 1:nrow(pred_ns),
+  e    = pred_ns[, "e"],
+  prod = pred_ns[, "prod"],
+  rw   = pred_ns[, "rw"],
+  U    = pred_ns[, "U"]
+)
+df_ns_long <- df_ns %>%
+  pivot_longer(cols = -HoldoutIndex, names_to = "variable", values_to = "Value") %>%
+  mutate(Method = "ns")
+
+# 5) Normal
+df_normal <- data.frame(
+  HoldoutIndex = 1:nrow(pred_norm),
+  e    = pred_norm[, "e"],
+  prod = pred_norm[, "prod"],
+  rw   = pred_norm[, "rw"],
+  U    = pred_norm[, "U"]
+)
+df_normal_long <- df_normal %>%
+  pivot_longer(cols = -HoldoutIndex, names_to = "variable", values_to = "Value") %>%
+  mutate(Method = "Normal")
+
+# 6) Ridge
+df_ridge <- data.frame(
+  HoldoutIndex = 1:nrow(pred_ridge),
+  e    = pred_ridge[, "e"],
+  prod = pred_ridge[, "prod"],
+  rw   = pred_ridge[, "rw"],
+  U    = pred_ridge[, "U"]
+)
+df_ridge_long <- df_ridge %>%
+  pivot_longer(cols = -HoldoutIndex, names_to = "variable", values_to = "Value") %>%
+  mutate(Method = "Ridge")
+
+# -- Combine all into one data frame
+df_plot <- bind_rows(
+  df_actual_long,
+  df_hs_long,
+  df_lasso_long,
+  df_normal_long,
+  df_ns_long,
+  df_ridge_long
 )
 
-# Gather predictions from each method
-pred_dfs <- list()
-for (m in names(results_list)) {
-  preds_mat <- results_list[[m]]$preds_levels  # Ttest_diff x d
-  df_m <- data.frame(
-    Time     = test_time,
-    Variable = rep(colnames(Y_levels), each = Ttest_diff),
-    Value    = as.vector(preds_mat),
-    Method   = m
-  )
-  pred_dfs[[m]] <- df_m
-}
-pred_df <- do.call(rbind, pred_dfs)
+# Optional: Control factor levels so that "Actual" is first, etc.
+df_plot$Method <- factor(df_plot$Method,
+                         levels = c("Actual","Horseshoe","Lasso","Normal","ns","Ridge"))
 
-# Combine actual and predictions
-plot_df <- rbind(actual_df, pred_df)
-
-# Plot: facet by variable, color by method
-# We'll give "Actual" a special color or line type
-ggplot(plot_df, aes(x = Time, y = Value, color = Method)) +
-  geom_line() +
-  facet_wrap(~ Variable, scales = "free_y") +
-  theme_bw(base_size = 14) +
+# -- Step B: Make the plot
+ggplot(df_plot, aes(x = HoldoutIndex, y = Value, color = Method)) +
+  geom_line(size = 1) +
+  facet_wrap(~ variable, scales = "free_y") +
   labs(
-    title = "Forecast vs. Actual on Test Set",
+    title = "Forecasts and Actuals on Test Set",
     x = "Holdout Index",
     y = "Value"
-  )
-# If you want "Actual" in black:
-# + scale_color_manual(values = c("Actual"="black", "Ridge"="red", ...))
+  ) +
+  # Match earlier figure color scheme:
+  scale_color_manual(values = c(
+    "Actual"         = "black",
+    "Horseshoe"      = "red",
+    "Lasso"          = "yellow",
+    "Normal"         = "green",
+    "ns"             = "blue",  # or "NonparamShrink" or "ns" as needed
+    "Ridge"          = "magenta"
+  )) +scale_linetype_manual(values = c(
+    "Actual"    = "dotted",
+    "Horseshoe" = "solid",
+    "Lasso"     = "solid",
+    "Normal"    = "solid",
+    "ns"        = "solid",
+    "Ridge"     = "solid"
+  )) +
+  theme_bw(base_size = 14)
 
-# -------------------------
-# 8) Also produce coefficient distribution plots
-# -------------------------
-desired_order <- c("Horseshoe", "Lasso", "Normal", "NonparamShrink", "Ridge")
 
-make_coefs_df <- function(B_mat, method_name) {
-  # Return a data frame with Method as a factor in the desired order
-  data.frame(
-    Method = factor(method_name, levels = desired_order),
-    CoefID = seq_along(B_mat),
-    Value  = as.numeric(B_mat)
-  )
-}
 
-coefs_ridge   <- make_coefs_df(Bhat_ridge,   "Ridge")
-coefs_ns      <- make_coefs_df(Bhat_ns,      "NonparamShrink")
-coefs_normal  <- make_coefs_df(Bhat_normal,  "Normal")
-coefs_lasso   <- make_coefs_df(Bhat_lasso,   "Lasso")
-coefs_hs      <- make_coefs_df(Bhat_hs,      "Horseshoe")
 
-all_coefs <- bind_rows(
-  coefs_hs,
-  coefs_lasso,
-  coefs_normal,
-  coefs_ns,
-  coefs_ridge
-)
+ggplot(df_plot,
+       aes(x = HoldoutIndex,
+           y = Value,
+           color = Method,
+           linetype = Method)) +  # <--- Add this mapping
+  geom_line(size = 1) +
+  facet_wrap(~ variable, scales = "free_y") +
+  labs(title = "Forecasts and Actuals on Test Set",
+       x = "Holdout Index",
+       y = "Value") +
+  scale_color_manual(values = c(
+    "Actual"         = "black",
+    "Horseshoe"      = "red",
+    "Lasso"          = "#B79F00",
+    "Normal"         = "#00BA38",
+    "ns"            = "#619CFF",
+    "Ridge"          = "#C77CFF"
+  )) +
+  scale_linetype_manual(values = c(
+    "Actual"    = "dotted",
+    "Horseshoe" = "solid",
+    "Lasso"     = "solid",
+    "Normal"    = "solid",
+    "ns"        = "solid",
+    "Ridge"     = "solid"
+  )) +
+  theme_bw(base_size = 14)
 
-ggplot(all_coefs, aes(x = Method, y = Value)) +
-  geom_boxplot() +
-  coord_flip() +
-  labs(title = "Distribution of Estimated Coefficients by Method",
-       y = "Coefficient Value",
-       x = "")
-
-# Or a violin + boxplot overlay:
-ggplot(all_coefs, aes(x = Method, y = Value)) +
-  geom_violin(trim = FALSE) +
-  geom_boxplot(width = 0.2, outlier.shape = NA) +
-  coord_flip() +
-  labs(title = "Distribution of Estimated Coefficients by Method",
-       y = "Coefficient Value", x = "")
-
-cat("\nDone! The script fitted the models, evaluated RMSE & MAPE, and plotted forecasts vs. actual.\n")
