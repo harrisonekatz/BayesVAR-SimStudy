@@ -8,19 +8,42 @@ data {
 }
 
 parameters {
-  matrix[d, d*p] B;      // coefficient matrix
-  real<lower=0> sigma;   // noise scale
+  // -- Coefficients --
+  matrix[d, d*p] B;
+
+  // -- Full covariance (Cholesky-based parameterization) --
+  cholesky_factor_corr[d] L_Omega;   // Cholesky factor of correlation matrix
+  vector<lower=0>[d] sigma_vec;      // per-dimension scale
+}
+
+transformed parameters {
+  matrix[d, d] Sigma;
+  {
+    matrix[d, d] L = diag_pre_multiply(sigma_vec, L_Omega);
+    Sigma = L * L';
+  }
 }
 
 model {
-  // Normal(0, prior_scale) on each entry of B:
+  // === Priors ===
+
+  // Prior on coefficients: Normal(0, prior_scale)
   to_vector(B) ~ normal(0, prior_scale);
 
-  // Likelihood:
+  // LKJ prior on the correlation part
+  L_Omega ~ lkj_corr_cholesky(2.0);
+
+  // Example prior for each dimension's scale, e.g. half-Cauchy
+  sigma_vec ~ cauchy(0, 2.5);
+
+  // === Likelihood ===
+
   for (t in 1:T) {
-    // Y[t, ] is 1 x d
-    // X[t, ] is 1 x (d*p)
-    // B' is (d*p) x d
-    Y[t] ~ normal(X[t] * B', sigma);
+    // Convert the row of X into a vector for the linear predictor
+    vector[d] mu_t = to_vector(X[t] * B');  // predicted mean (d-dimensional)
+    vector[d] y_t  = to_vector(Y[t]);       // observed response (d-dimensional)
+
+    // Multivariate normal with mean mu_t and covariance Sigma
+    y_t ~ multi_normal(mu_t, Sigma);
   }
 }
