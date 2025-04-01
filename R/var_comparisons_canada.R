@@ -167,7 +167,7 @@ mape <- function(actual, predicted, eps=1e-8) {
 # -------------------------
 # 5) Choose a lag order p
 # -------------------------
-p <- 10
+p <- 11
 
 # Make design matrix from Ytrain_diff
 train_data <- make_VAR_design_p(Ytrain_diff, p)
@@ -464,7 +464,7 @@ ggplot(df_plot,
     "Horseshoe"      = "red",
     "Lasso"          = "#B79F00",
     "Normal"         = "#00BA38",
-    "ns"            = "#619CFF",
+    "ns"            = "deepskyblue1",
     "Ridge"          = "#C77CFF"
   )) +
   scale_linetype_manual(values = c(
